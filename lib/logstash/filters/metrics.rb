@@ -150,6 +150,9 @@ class LogStash::Filters::Metrics < LogStash::Filters::Base
   # The percentiles that should be measured and emitted for timer values.
   config :percentiles, :validate => :array, :default => [1, 5, 10, 90, 95, 99, 100]
 
+  # Output only one metric per event in flat data format
+  config :emit_single_metrics,:validate => :boolean, :default => false
+
   def register
     require "metriks"
     require "socket"
@@ -194,26 +197,60 @@ class LogStash::Filters::Metrics < LogStash::Filters::Base
     # Do nothing if there's nothing to do ;)
     return unless should_flush?
 
-    event = LogStash::Event.new
-    event.set("message", @host)
-    @metric_meters.each_pair do |name, metric|
-      flush_rates event, name, metric
-      metric.clear if should_clear?
-    end
+    events = []
 
-    @metric_timers.each_pair do |name, metric|
-      flush_rates event, name, metric
-      # These 4 values are not sliding, so they probably are not useful.
-      event.set("[#{name}][min]", metric.min)
-      event.set("[#{name}][max]", metric.max)
-      # timer's stddev currently returns variance, fix it.
-      event.set("[#{name}][stddev]", metric.stddev ** 0.5)
-      event.set("[#{name}][mean]", metric.mean)
+    if @emit_single_metrics
+        @metric_meters.each_pair do |name, metric|
+          event = LogStash::Event.new
+          event.set("message", @host)
+          flush_rates_single event, name, metric
+          metric.clear if should_clear?
+          filter_matched(event)
+          events << event
+        end
 
-      @percentiles.each do |percentile|
-        event.set("[#{name}][p#{percentile}]", metric.snapshot.value(percentile / 100.0))
-      end
-      metric.clear if should_clear?
+        @metric_timers.each_pair do |name, metric|
+          event = LogStash::Event.new
+          event.set("message", @host)
+          flush_rates_single event, name, metric
+          # These 4 values are not sliding, so they probably are not useful.
+          event.set("min", metric.min)
+          event.set("max", metric.max)
+          # timer's stddev currently returns variance, fix it.
+          event.set("stddev", metric.stddev ** 0.5)
+          event.set("mean", metric.mean)
+          @percentiles.each do |percentile|
+            event.set("p#{percentile}", metric.snapshot.value(percentile / 100.0))
+          end
+          event.set("name", "#{name}")
+          metric.clear if should_clear?
+          filter_matched(event)
+          events << event
+        end
+    else
+        event = LogStash::Event.new
+        event.set("message", @host)
+        @metric_meters.each_pair do |name, metric|
+          flush_rates event, name, metric
+          metric.clear if should_clear?
+        end
+
+        @metric_timers.each_pair do |name, metric|
+          flush_rates event, name, metric
+          # These 4 values are not sliding, so they probably are not useful.
+          event.set("[#{name}][min]", metric.min)
+          event.set("[#{name}][max]", metric.max)
+          # timer's stddev currently returns variance, fix it.
+          event.set("[#{name}][stddev]", metric.stddev ** 0.5)
+          event.set("[#{name}][mean]", metric.mean)
+          @percentiles.each do |percentile|
+            event.set("[#{name}][p#{percentile}]", metric.snapshot.value(percentile / 100.0))
+          end
+          metric.clear if should_clear?
+        end
+
+        filter_matched(event)
+        events << event
     end
 
     # Reset counter since metrics were flushed
@@ -226,8 +263,7 @@ class LogStash::Filters::Metrics < LogStash::Filters::Base
       @metric_timers.clear
     end
 
-    filter_matched(event)
-    return [event]
+    return events
   end
 
   # this is a temporary fix to enable periodic flushes without using the plugin config:
@@ -240,6 +276,15 @@ class LogStash::Filters::Metrics < LogStash::Filters::Base
   end
 
   private
+
+  def flush_rates_single(event, name, metric)
+    event.set("count", metric.count)
+    event.set("rate_1m", metric.one_minute_rate) if @rates.include? 1
+    event.set("rate_5m", metric.five_minute_rate) if @rates.include? 5
+    event.set("rate_15m", metric.fifteen_minute_rate) if @rates.include? 15
+    event.set("name", "#{name}")
+  end
+
 
   def flush_rates(event, name, metric)
       event.set("[#{name}][count]", metric.count)
